@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { v4 } from "uuid";
+import WebSocket from "ws";
 import type pino from "pino";
 import type {
   SpeechToTextProvider,
@@ -11,19 +12,22 @@ export interface FunASRSTTConfig {
   timeoutMs?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 60000;
 
 export class FunASRSTT implements SpeechToTextProvider {
   public readonly id = "funasr";
   private readonly url: string;
+  private readonly wsUrl: string;
   private readonly timeoutMs: number;
   private readonly logger: pino.Logger;
 
   constructor(config: FunASRSTTConfig, parentLogger: pino.Logger) {
-    this.url = config.url;
+    this.url = config.url.replace(/\/+$/, "");
+    // Derive WebSocket URL from HTTP URL
+    this.wsUrl = this.url.replace(/^http/, "ws");
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.logger = parentLogger.child({ module: "speech", provider: "funasr", component: "stt" });
-    this.logger.info({ url: this.url }, "FunASR STT initialized");
+    this.logger.info({ url: this.url, wsUrl: this.wsUrl }, "FunASR STT initialized");
   }
 
   public createSession(params: {
@@ -34,56 +38,106 @@ export class FunASRSTT implements SpeechToTextProvider {
     const emitter = new EventEmitter();
     const logger = params.logger.child({ provider: "funasr", component: "stt-session" });
     const requiredSampleRate = 16000;
-    const url = this.url;
+    const wsUrl = this.wsUrl;
     const timeoutMs = this.timeoutMs;
 
+    let ws: WebSocket | null = null;
     let connected = false;
     let segmentId = v4();
     let previousSegmentId: string | null = null;
-    let pcm16: Buffer = Buffer.alloc(0);
-
-    const convertPCMToWavBuffer = (pcmBuffer: Buffer): Buffer => {
-      const headerSize = 44;
-      const channels = 1;
-      const bitsPerSample = 16;
-      const sampleRate = requiredSampleRate;
-      const wavBuffer = Buffer.alloc(headerSize + pcmBuffer.length);
-      const byteRate = (sampleRate * channels * bitsPerSample) / 8;
-      const blockAlign = (channels * bitsPerSample) / 8;
-
-      wavBuffer.write("RIFF", 0);
-      wavBuffer.writeUInt32LE(36 + pcmBuffer.length, 4);
-      wavBuffer.write("WAVE", 8);
-      wavBuffer.write("fmt ", 12);
-      wavBuffer.writeUInt32LE(16, 16);
-      wavBuffer.writeUInt16LE(1, 20);
-      wavBuffer.writeUInt16LE(channels, 22);
-      wavBuffer.writeUInt32LE(sampleRate, 24);
-      wavBuffer.writeUInt32LE(byteRate, 28);
-      wavBuffer.writeUInt16LE(blockAlign, 32);
-      wavBuffer.writeUInt16LE(bitsPerSample, 34);
-      wavBuffer.write("data", 36);
-      wavBuffer.writeUInt32LE(pcmBuffer.length, 40);
-      pcmBuffer.copy(wavBuffer, 44);
-
-      return wavBuffer;
-    };
+    // Track partial segment IDs so DictationStreamManager can aggregate them
+    let partialSegmentId = v4();
 
     return {
       requiredSampleRate,
       async connect() {
-        connected = true;
+        return new Promise<void>((resolve, reject) => {
+          const wsEndpoint = `${wsUrl}/ws/transcribe`;
+          logger.debug({ wsEndpoint }, "Connecting to FunASR WebSocket");
+
+          const socket = new WebSocket(wsEndpoint);
+          let resolved = false;
+
+          const connectTimeout = setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              socket.close();
+              reject(new Error("FunASR WebSocket connection timeout"));
+            }
+          }, 10000);
+
+          socket.on("open", () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(connectTimeout);
+            ws = socket;
+            connected = true;
+            logger.debug("FunASR WebSocket connected");
+            resolve();
+          });
+
+          socket.on("message", (data) => {
+            let parsed: { type: string; text?: string; error?: string };
+            try {
+              parsed = JSON.parse(data.toString());
+            } catch {
+              return;
+            }
+
+            if (parsed.type === "partial" && parsed.text !== undefined) {
+              logger.debug({ text: parsed.text }, "FunASR partial transcript");
+              (emitter as any).emit("transcript", {
+                segmentId: partialSegmentId,
+                transcript: parsed.text,
+                isFinal: false,
+              });
+            } else if (parsed.type === "final" && parsed.text !== undefined) {
+              logger.debug({ text: parsed.text }, "FunASR final transcript");
+              // Emit the final result on the committed segment ID
+              (emitter as any).emit("transcript", {
+                segmentId,
+                transcript: parsed.text,
+                isFinal: true,
+              });
+            } else if (parsed.type === "error") {
+              (emitter as any).emit("error", new Error(parsed.error ?? "FunASR server error"));
+            }
+          });
+
+          socket.on("error", (err) => {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(connectTimeout);
+              reject(err);
+              return;
+            }
+            (emitter as any).emit("error", err);
+          });
+
+          socket.on("close", () => {
+            connected = false;
+            ws = null;
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(connectTimeout);
+              reject(new Error("FunASR WebSocket closed before ready"));
+            }
+          });
+        });
       },
+
       appendPcm16(chunk: Buffer) {
-        if (!connected) {
-          (emitter as any).emit("error", new Error("STT session not connected"));
+        if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+          (emitter as any).emit("error", new Error("FunASR STT session not connected"));
           return;
         }
-        pcm16 = pcm16.length === 0 ? chunk : Buffer.concat([pcm16, chunk]);
+        // Send raw PCM16 bytes directly over WebSocket
+        ws.send(chunk);
       },
+
       commit() {
-        if (!connected) {
-          (emitter as any).emit("error", new Error("STT session not connected"));
+        if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+          (emitter as any).emit("error", new Error("FunASR STT session not connected"));
           return;
         }
 
@@ -91,74 +145,46 @@ export class FunASRSTT implements SpeechToTextProvider {
         const prev = previousSegmentId;
         (emitter as any).emit("committed", { segmentId: committedId, previousSegmentId: prev });
 
-        if (pcm16.length === 0) {
-          (emitter as any).emit("transcript", {
-            segmentId: committedId,
-            transcript: "",
-            isFinal: true,
-            isLowConfidence: true,
-          });
-          previousSegmentId = committedId;
-          segmentId = v4();
-          return;
-        }
+        // Send finish signal — server will respond with final transcript
+        ws.send(JSON.stringify({ type: "finish" }));
 
-        const audioBuffer = pcm16;
-        pcm16 = Buffer.alloc(0);
+        // Set up timeout for final response
+        const finalTimeout = setTimeout(() => {
+          logger.warn("FunASR final transcript timeout");
+          (emitter as any).emit("error", new Error("FunASR final transcript timeout"));
+        }, timeoutMs);
 
-        void (async () => {
-          try {
-            const wav = convertPCMToWavBuffer(audioBuffer);
-            const formData = new FormData();
-            const wavBytes = new Uint8Array(
-              wav.buffer as ArrayBuffer,
-              wav.byteOffset,
-              wav.byteLength,
-            );
-            formData.append(
-              "file",
-              new Blob([wavBytes], { type: "audio/wav" }),
-              "audio.wav",
-            );
-
-            const response = await fetch(`${url}/transcribe`, {
-              method: "POST",
-              body: formData,
-              signal: AbortSignal.timeout(timeoutMs),
-            });
-
-            if (!response.ok) {
-              throw new Error(
-                `FunASR server returned HTTP ${response.status}: ${response.statusText}`,
-              );
-            }
-
-            const result = (await response.json()) as { text: string };
-
-            logger.debug({ text: result.text }, "FunASR transcription complete");
-
-            (emitter as any).emit("transcript", {
-              segmentId: committedId,
-              transcript: result.text,
-              isFinal: true,
-            });
-          } catch (err) {
-            logger.error({ err }, "FunASR transcription error");
-            (emitter as any).emit("error", err);
-          } finally {
-            previousSegmentId = committedId;
-            segmentId = v4();
+        // Listen for the final event to clear timeout
+        const onTranscript = (payload: { segmentId: string; isFinal: boolean }) => {
+          if (payload.segmentId === committedId && payload.isFinal) {
+            clearTimeout(finalTimeout);
+            emitter.removeListener("transcript", onTranscript);
           }
-        })();
-      },
-      clear() {
-        pcm16 = Buffer.alloc(0);
+        };
+        emitter.on("transcript", onTranscript);
+
+        previousSegmentId = committedId;
         segmentId = v4();
+        partialSegmentId = v4();
       },
+
+      clear() {
+        segmentId = v4();
+        partialSegmentId = v4();
+      },
+
       close() {
         connected = false;
-        pcm16 = Buffer.alloc(0);
+        if (ws) {
+          try {
+            ws.close();
+          } catch {
+            // no-op
+          }
+          ws = null;
+        }
       },
+
       on(event: any, handler: any) {
         emitter.on(event, handler);
         return undefined;
