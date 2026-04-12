@@ -38,7 +38,7 @@ const OptionalBooleanFlagSchema = z
   });
 
 const RequestedSpeechProvidersSchema = z.object({
-  dictationStt: OptionalSpeechProviderSchema.default("local"),
+  dictationStt: OptionalSpeechProviderSchema.default("funasr"),
   voiceTurnDetection: OptionalSpeechProviderSchema.default("local"),
   voiceStt: OptionalSpeechProviderSchema.default("local"),
   voiceTts: OptionalSpeechProviderSchema.default("local"),
@@ -99,7 +99,7 @@ function resolveRequestedSpeechProviders(params: {
   >;
 
   const parsed = RequestedSpeechProvidersSchema.parse({
-    dictationStt: featureProviders.dictationStt.configuredValue ?? "local",
+    dictationStt: featureProviders.dictationStt.configuredValue ?? "funasr",
     voiceTurnDetection: featureProviders.voiceTurnDetection.configuredValue ?? "local",
     voiceStt: featureProviders.voiceStt.configuredValue ?? "local",
     voiceTts: featureProviders.voiceTts.configuredValue ?? "local",

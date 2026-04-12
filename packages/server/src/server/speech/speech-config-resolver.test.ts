@@ -19,7 +19,7 @@ describe("resolveSpeechConfig", () => {
 
     expect(result.openai).toBeUndefined();
     expect(result.speech.providers.dictationStt).toEqual({
-      provider: "local",
+      provider: "funasr",
       explicit: false,
       enabled: true,
     });
@@ -180,7 +180,7 @@ describe("resolveSpeechConfig", () => {
     });
 
     expect(result.speech.providers.dictationStt).toEqual({
-      provider: "local",
+      provider: "funasr",
       explicit: false,
       enabled: false,
     });
