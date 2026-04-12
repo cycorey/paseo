@@ -1165,6 +1165,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(funct
             isRecording={isDictating}
             isProcessing={isDictationProcessing}
             status={dictationStatus}
+            transcript={dictationPartialTranscript || undefined}
             errorText={dictationStatus === "failed" ? (dictationError ?? undefined) : undefined}
             onCancel={handleCancelRecording}
             onAccept={handleAcceptRecording}
