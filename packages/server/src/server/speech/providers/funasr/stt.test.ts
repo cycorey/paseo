@@ -52,7 +52,7 @@ describe("FunASRSTT", () => {
     const session = stt.createSession({ logger });
 
     const errors: Error[] = [];
-    session.on("error", (err: Error) => errors.push(err));
+    session.on("error", (err) => errors.push(err as Error));
 
     await session.connect();
     session.appendPcm16(Buffer.alloc(100));

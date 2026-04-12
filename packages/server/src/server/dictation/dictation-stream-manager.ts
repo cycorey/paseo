@@ -176,7 +176,7 @@ export class DictationStreamManager {
     try {
       stt = sttProvider.createSession({
         logger: this.logger.child({ dictationId }),
-        language: "en",
+        ...(sttProvider.id === "funasr" ? {} : { language: "en" }),
         prompt: transcriptionPrompt,
       });
     } catch (error) {
