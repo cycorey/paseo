@@ -40,6 +40,8 @@ SILENCE_DURATION_MS = int(os.environ.get("FUNASR_SILENCE_DURATION_MS", "600"))
 SILENCE_DURATION_SAMPLES = int(SILENCE_DURATION_MS * SAMPLE_RATE / 1000)
 OVERLAP_S = float(os.environ.get("FUNASR_OVERLAP", "0.5"))
 OVERLAP_SAMPLES = int(OVERLAP_S * SAMPLE_RATE)
+# Final pass mode: "full" = re-transcribe everything with VAD, "tail" = only transcribe unprocessed tail
+FINAL_MODE = os.environ.get("FUNASR_FINAL_MODE", "tail")
 
 _SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
 
@@ -218,7 +220,7 @@ async def ws_transcribe(ws: WebSocket):
     detector = SilenceDetector()
     finished_event = threading.Event()
 
-    # Queue of ASR requests: ("timer", chunk) or ("silence", seg) or ("final", full)
+    # Queue of ASR requests: ("timer"|"silence"|"tail", chunk) or ("final", full)
     asr_queue: list[tuple[str, np.ndarray]] = []
     asr_has_work = threading.Event()
 
@@ -243,6 +245,9 @@ async def ws_transcribe(ws: WebSocket):
                 elif kind == "silence":
                     text = _transcribe(samples_arr)
                     loop.call_soon_threadsafe(result_queue.put_nowait, ("silence", text))
+                elif kind == "tail":
+                    text = _transcribe(samples_arr)
+                    loop.call_soon_threadsafe(result_queue.put_nowait, ("tail", text))
                 elif kind == "final":
                     text = _transcribe_vad(samples_arr)
                     loop.call_soon_threadsafe(result_queue.put_nowait, ("final", text))
@@ -357,30 +362,71 @@ async def ws_transcribe(ws: WebSocket):
                     continue
 
                 if data.get("type") == "finish":
-                    with lock:
-                        if all_samples:
-                            full = np.concatenate(all_samples)
-                        else:
-                            full = np.array([], dtype=np.int16)
-                    _enqueue("final", full)
-                    finished_event.set()
-                    asr_has_work.set()
+                    if FINAL_MODE == "tail":
+                        # Tail mode: keep committed sentences, only re-transcribe
+                        # the current (last) sentence from sentence_start to end
+                        with lock:
+                            if all_samples:
+                                full = np.concatenate(all_samples)
+                                last_sentence = full[max(0, sentence_start - OVERLAP_SAMPLES):]
+                            else:
+                                last_sentence = np.array([], dtype=np.int16)
+                        if len(last_sentence) >= MIN_SPEECH_SAMPLES:
+                            _enqueue("tail", last_sentence)
+                        finished_event.set()
+                        asr_has_work.set()
 
-                    # Wait for final result
-                    while True:
-                        kind, text = await result_queue.get()
-                        if kind == "final":
-                            await ws.send_json({"type": "final", "text": text})
-                            break
-                        # Process any remaining partials
-                        if kind == "timer" and text:
-                            with lock:
-                                current_text = text
-                        elif kind == "silence":
-                            with lock:
-                                current_text = ""
-                                if text:
-                                    committed.append(text)
+                        # Wait for tail result
+                        tail_text = ""
+                        while True:
+                            try:
+                                kind, text = await asyncio.wait_for(result_queue.get(), timeout=10)
+                            except asyncio.TimeoutError:
+                                break
+                            if kind == "tail":
+                                tail_text = text
+                                break
+                            if kind == "timer" and text:
+                                with lock:
+                                    current_text = text
+                            elif kind == "silence":
+                                with lock:
+                                    current_text = ""
+                                    if text:
+                                        committed.append(text)
+
+                        with lock:
+                            parts = committed[:]
+                        # Use tail transcription for last sentence, fall back to timer result
+                        parts.append(tail_text if tail_text else current_text)
+                        final_text = "".join(parts)
+                        await ws.send_json({"type": "final", "text": final_text})
+                    else:
+                        # Full mode: re-transcribe everything with VAD
+                        with lock:
+                            if all_samples:
+                                full = np.concatenate(all_samples)
+                            else:
+                                full = np.array([], dtype=np.int16)
+                        _enqueue("final", full)
+                        finished_event.set()
+                        asr_has_work.set()
+
+                    if FINAL_MODE != "tail":
+                        # Wait for final result
+                        while True:
+                            kind, text = await result_queue.get()
+                            if kind == "final":
+                                await ws.send_json({"type": "final", "text": text})
+                                break
+                            if kind == "timer" and text:
+                                with lock:
+                                    current_text = text
+                            elif kind == "silence":
+                                with lock:
+                                    current_text = ""
+                                    if text:
+                                        committed.append(text)
                         with lock:
                             parts = committed[:]
                             if current_text:
