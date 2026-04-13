@@ -190,25 +190,54 @@ The STT server behavior is configurable via environment variables:
 
 ## Daemon Configuration
 
-To enable the external STT server in Paseo:
+By default, Paseo uses the built-in local STT provider (sherpa-onnx). The external STT server is **opt-in** — you must explicitly enable it.
 
-**Environment variable:**
+### Quick Start
+
+1. Start the STT server:
+   ```bash
+   cd packages/funasr-server
+   pip install -r requirements.txt
+   python server.py
+   ```
+
+2. Configure Paseo to use it (pick one method):
+
+**Method A — Environment variable (per-session):**
 ```bash
-PASEO_DICTATION_STT_PROVIDER=funasr
-PASEO_FUNASR_URL=http://127.0.0.1:10095  # optional, this is the default
+PASEO_DICTATION_STT_PROVIDER=funasr paseo start
 ```
 
-**Config file** (`~/.paseo/config.json`):
+**Method B — Config file (persistent, recommended):**
+
+Edit `~/.paseo/config.json`:
 ```json
 {
   "features": {
     "dictation": {
       "stt": { "provider": "funasr" }
     }
-  },
+  }
+}
+```
+
+Then restart the daemon for changes to take effect.
+
+### Optional: Custom Server URL
+
+If the STT server runs on a non-default address:
+
+**Environment variable:**
+```bash
+PASEO_FUNASR_URL=http://192.168.1.100:10095
+```
+
+**Config file:**
+```json
+{
   "providers": {
     "funasr": {
-      "url": "http://127.0.0.1:10095"
+      "url": "http://192.168.1.100:10095"
     }
   }
 }
